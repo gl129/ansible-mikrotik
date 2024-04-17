@@ -1,5 +1,8 @@
 #!/usr/bin/python3
 
+# Copyright: (c) 2022-2024, Gennady Lapin <gennady.lapin@gmail.com>
+# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
+
 import copy
 import itertools
 import re

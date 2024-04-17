@@ -7,11 +7,14 @@ See gl_mikrotik.yml, inventory and group_vars for samples and solutions.
 
 Structure:
 
-```action_plugins/         Ansible action plugin (Python)
+```
+action_plugins/         Ansible action plugin (Python)
 files/                  Mikrotik's files to transfer. scripts, public keys. etc.
 filter_plugins/         Ansible filter plugins (Python)
-group_vars/             Ansible group variables. Main configuration source.
-inventory/              Ansible inventory files
+group_vars/             Ansible group variables (YML). Main configuration source.
+inventory/              Ansible inventory files (YML)
+lookup_plugins/         Ansible lookup plugins (Python)
 tasks/                  Ansible directory to include tasks from
 ansible.cfg             Ansible main configuration file for Mikrotik plays
-gl_mikrotik.yml         Ansible main configuration play. Almost all configs are taken from group_vars folder```
+gl_mikrotik.yml         Ansible main configuration play. Almost all configs are taken from group_vars folder
+```

@@ -1,0 +1,801 @@
+# Copyright: (c) 2022-2024, Gennady Lapin <gennady.lapin@gmail.com>
+# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
+
+- name: Set up abstract router
+  hosts: '{{ ansible_limit | mandatory }}'
+
+  tasks:
+
+    - name: Set initial host address
+      tags: always
+      when: initial is defined
+      set_fact:
+        save_ansible_host: '{{ ansible_host }}'
+        ansible_host: '{{ initial_host|mandatory }}'
+
+    - name: Clear host key
+      tags: always
+      when: initial is defined
+      local_action: command ssh-keygen -R {{ ansible_host }}
+      changed_when: false
+      failed_when: false
+
+    - name: Set replacement router address
+      tags: always
+      when: replacement is defined
+      set_fact:
+        router_ipaddr: '{{ replacement }}'
+
+    - name: Check for empty admin password
+      tags: [ create-users ]
+      when: initial is defined
+      local_action: command ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -o PasswordAuthentication=no admin@{{ initial_host }} :put "<EMPTY>"
+      changed_when: false
+      failed_when: false
+      register: admin_empty_password_ret
+
+    - name: Set admin/nopasswd credentials
+      tags: [ create-users ]
+      when: initial is defined and admin_empty_password_ret is defined and admin_empty_password_ret.stdout is search("<EMPTY>")
+      set_fact:
+        ansible_user: admin
+        ansible_ssh_pass: ''
+
+    - name: Gather facts
+      tags: always
+      import_tasks: tasks/gather.yml
+
+    - name: Debug variables
+      tags: always
+      when: "'debug' in vars"
+      block:
+        - import_tasks: tasks/actual_ports.yml
+        - import_tasks: tasks/actual_vlans.yml
+        - debug:
+            msg: '{{ debug|mandatory }}'
+        - when: debug|type_debug == 'str' and debug in vars
+          debug:
+            msg: '{{ hostvars[inventory_hostname][debug|mandatory] }}'
+        - meta: end_host
+
+    - name: Fetch files
+      tags: [ fetch ]
+      loop: '{{ fetches | default([]) }}'
+      check_mode: false  # always fetch files
+      mikrotik:
+        fetch: '{{ item }}'
+
+    - name: Copy configuration files
+      tags: [ create-users, files ]
+      loop: '{{ files | default([]) }}'
+      mikrotik:
+        put: '{{ item }}'
+
+    - name: Groups setup
+      tags: [ create-users, users ]
+      loop: '{{ user_groups }}'
+      mikrotik:
+        path: /user group
+        state: present # can't replace because of predefined groups
+        find: '{{ item | selectkey("name") }}'
+        set:  '{{ item | rejectkey("name") | combine({"policy":new_policy}) }}'
+      vars:
+        v6_policy: '{{ item.policy | reject("match","^!?(rest-api)$") }}'
+        v7_policy: '{{ item.policy | reject("match","^!?(tikapp|dude)$") }}'
+        new_policy: '{{ v6_policy if mikrotik.OS == 6 else v7_policy }}'
+
+    - name: Users create
+      tags: [ never, create-users ]
+      mikrotik:
+        path: /user
+        state: adjust # can't replace because of predefined users
+        keys: [ name ]
+        lines: '{{ users | map("rejectkey",["disabled"]) }}' # do not disable admin user when no other users created
+
+    - name: Users public-keys one-time setup
+      tags: [ never, create-users, ssh-keys ]
+      mikrotik:
+        # don't indent - will honor \n's
+        cmd: >-
+            /user ssh-key remove [find]; 
+            :foreach u in=[/user find] do={
+            :local fileid ([/file find name~"$[/user get $u name]_public"]->0);
+            :if ( [:typeof $fileid] != "nothing" ) do={ /user ssh-key import user=$u public-key-file=$fileid }
+            };
+            /ip ssh set always-allow-password-login=yes
+
+    - name: Users setup
+      tags: [ users ]
+      mikrotik:
+        path: /user
+        state: adjust
+        keys: [ name ]
+        lines: '{{ users | map("rejectkey",["password"]) }}'
+
+    - name: Package manipulation
+      tags: [ never, packages ]
+      block:
+        - name: Enable packages
+          loop: '{{ packages | default([]) | selectattr("state","eq","required") | rejectattr("name","in",mikrotik.packages) }}'
+          mikrotik:
+            path: /system package
+            state: enabled
+            find:
+              name: '{{ item.name }}'
+          register: _enabled_packages_ret
+        - name: Disable packages
+          loop: '{{ packages | default([]) | selectattr("state","eq","disabled") | selectattr("name","in",mikrotik.packages) }}'
+          mikrotik:
+            path: /system package
+            state: disabled
+            find:
+              name: '{{ item.name }}'
+          register: _disabled_packages_ret
+        - name: Reboot if necessary 
+          when: _enabled_packages_ret is changed or _disabled_packages_ret is changed
+          mikrotik:
+            cmd: /system reboot
+        - when: _enabled_packages_ret is changed or _disabled_packages_ret is changed
+          fail:
+            msg: '!!! REBOOT ROUTER AFTER PACKAGES MANIPULATIONS !!!'
+
+    - name: Check requirements
+      tags: [ requirements ]
+      block:
+        - name: RouterOS
+          when: required_OS is defined and required_OS != mikrotik.OS
+          fail:
+            msg: Incompatible version ( required '{{ required_OS }}', present '{{ mikrotik.OS }}'
+        - name: Missing packages
+          when: mikrotik.OS == 6 
+          loop: '{{ packages | default([]) | selectattr("state","eq","required") | rejectattr("name","in",mikrotik.packages) }}'
+          fail:
+            msg: Missing required package "{{ item.name }}"
+        - name: Disabled packages
+          when: mikrotik.OS == 6 
+          loop: '{{ packages | default([]) | selectattr("state","eq","disabled") | selectattr("name","in",mikrotik.packages) }}'
+          fail:
+            msg: Package "{{ item.name }}" should be disabled
+
+    - name: RouterOS 6 and 7
+      when: mikrotik.OS in [6,7]
+      block:
+
+#        - name: Ethernet interfaces
+#          tags: [ interfaces, dangerous ]
+#          mikrotik:
+#            path: /interface ethernet
+#            state: notfound-is-ok
+#            lines: '{{ ethernets | default([]) }}'
+#
+#        - import_tasks: tasks/actual.yml
+#          tags: always
+
+#        - name: Disable WANs
+#          tags: [ dangerous ]
+#          when: ansible_check_mode == false and disable_wans|default(false)
+#          mikrotik:
+#            path: /interface
+#            state: disabled
+#            iterate:
+#              name: '{{ _WANs | default([]) | map(attribute="interface") }}'
+    
+        - name: Settings and servers
+          tags: [ settings ]
+          block:
+
+            - name: Cloud settings
+              mikrotik:
+                path: /ip cloud
+                set: '{{ cloud_settings | default( { "ddns-enabled": "no" } ) }}'
+   
+            - name: DNS settings
+              mikrotik:
+                path: /ip dns
+                set: '{{ dns_settings | mandatory }}'
+    
+            - name: Static DNS records
+              mikrotik:
+                path: /ip dns static
+                state: replace
+                lines: '{{ dns_statics | default([]) }}'
+    
+            - name: SSH settings
+              mikrotik:
+                path: /ip ssh
+                set: '{{ ssh_settings | mandatory }}'
+    
+            - name: System time settings
+              mikrotik:
+                path: /system clock
+                set: '{{ clock_settings | mandatory }}'
+    
+            - name: Identity
+              mikrotik:
+                path: /system identity
+                set: { name: '{{ identity | mandatory }}' }
+    
+            - name: NTP client
+              mikrotik:
+                path: /system ntp client
+                set: '{{ ntp_client_settings | mandatory }}'
+    
+            - name: NTP server
+              when: ntp_server_settings is defined and (mikrotik.OS > 6 or 'ntp' in mikrotik.packages)
+              mikrotik:
+                path: /system ntp server
+                set: '{{ ntp_server_settings }}'
+    
+            - name: SNMP settings
+              mikrotik:
+                path: /snmp
+                set: '{{ snmp_settings | mandatory }}'
+    
+            - name: SNMP communities
+              mikrotik:
+                path: /snmp community
+                state: replace
+                lines: '{{ snmp_communities | default([]) }}'
+
+            - name: IP settings
+              when: ip_settings is defined
+              mikrotik:
+                path: /ip settings
+                set: '{{ ip_settings }}'
+
+            - name: IP services
+              loop: '{{ services | default([]) }}'
+              mikrotik:
+                path: /ip service
+                state: notfound-is-ok
+                find: '{{ item | selectkey("name") }}'
+                set: '{{ item | rejectkey("name") }}'
+
+            - name: Webproxy settings
+              mikrotik:
+                path: /ip proxy
+                set: '{{ webproxy_settings }}'
+
+            - name: Bandwidth test server
+              mikrotik:
+                path: /tool bandwidth-server
+                set: '{{ btest_settings }}'
+
+            - name: Log settings
+              when: logging is defined
+              loop: '{{ logging }}'
+              mikrotik:
+                path: /system logging
+                find:
+                  _raw: '($topics->0)="{{ item.topics[0] }}"'
+                set: '{{ item }}'
+
+        # END: Settings
+
+        - name: Interfaces
+          tags: [ interfaces ]
+          block:
+
+            - name: Ethernet interfaces
+              tags: [ interfaces, dangerous ]
+              mikrotik:
+                path: /interface ethernet
+                state: notfound-is-ok
+                lines: '{{ ethernets | default([]) }}'
+    
+            - import_tasks: tasks/actual_ports.yml
+              tags: always
+
+            - name: EOIP tunnels
+              mikrotik:
+                path: /interface eoip
+                state: replace
+                lines: '{{ eoip_tunnels|default([]) }}'
+
+            - name: Bridges w/o Vlan filtering
+              tags: [ dangerous ]
+              mikrotik:
+                path: /interface bridge
+                state: adjust
+                keys: [ name ]
+                lines: '{{ bridges | default([]) | map("rejectkey","vlan-filtering") }}'
+    
+            - name: VLANs
+              mikrotik:
+                path: /interface vlan
+                state: replace
+                lines: '{{ vlans | default([]) }}'
+   
+            - import_tasks: tasks/actual_vlans.yml
+              tags: always
+
+            - name: Bridge ports
+              tags: [ dangerous ]
+              mikrotik:
+                path: /interface bridge port
+                state: adjust
+                keys: [ interface ]
+                lines: '{{ bridge_ports | default([]) }}'
+    
+            - name: Bridge VLANs
+              mikrotik:
+                path: /interface bridge vlan
+                state: adjust
+                keys: [ bridge, vlan-ids ]
+                lines: '{{ bridge_vlans | default([]) }}'
+    
+            - name: Bridge filters
+              tags: [ brfilters ]
+              mikrotik:
+                path: /interface bridge filter
+                state: replace
+                ordered: '{{ bridge_filters | default([]) }}'
+    
+            - name: Bridges with Vlan filtering
+              tags: [ dangerous ]
+              mikrotik:
+                path: /interface bridge
+                state: adjust
+                keys: [ name ]
+                lines: '{{ bridges | default([]) }}'
+
+            - name: Interface lists
+              mikrotik:
+                path: /interface list
+                state: replace
+                lines: '{{ interface_lists | default([]) }}'
+    
+            - name: Address pools
+              mikrotik:
+                path: /ip pool
+                state: replace
+                lines: '{{ address_pools | default([]) }}'
+
+            - name: PPP profiles
+              when: mikrotik.OS > 6 or 'ppp' in mikrotik.packages
+              mikrotik:
+                path: /ppp profile
+                state: replace
+                lines: '{{ ppp_profiles | default([]) }}'
+    
+            - name: PPP secrets
+              when: mikrotik.OS > 6 or 'ppp' in mikrotik.packages
+              mikrotik:
+                path: /ppp secret
+                state: adjust
+                keys: [ name ]
+                lines: '{{ ppp_secrets | default([]) }}'
+    
+            - name: L2TP server settings
+              when: mikrotik.OS > 6 or 'ppp' in mikrotik.packages
+              mikrotik:
+                path: /interface l2tp-server server
+                set: '{{ l2tp_server_settings | default( { "enabled": "no" } ) }}'
+    
+            - name: L2TP clients
+              when: mikrotik.OS > 6 or 'ppp' in mikrotik.packages
+              mikrotik:
+                path: /interface l2tp-client
+                state: replace
+                lines: '{{ l2tp_clients | default([]) }}'
+    
+            - name: IPSEC proposals
+              tags: [ ipsec ]
+              mikrotik:
+                path: /ip ipsec proposal
+                state: replace
+                lines: '{{ ipsec_proposals | default([]) }}'
+    
+            - name: IPSEC peers
+              tags: [ ipsec ]
+              mikrotik:
+                path: /ip ipsec peer
+                state: replace
+                lines: '{{ ipsec_peers | default([]) }}'
+    
+            - name: IPSEC identities
+              tags: [ ipsec ]
+              mikrotik:
+                path: /ip ipsec identity
+                state: replace
+                lines: '{{ ipsec_identities | default([]) }}'
+    
+            - name: IPSEC policies
+              tags: [ ipsec ]
+              mikrotik:
+                path: /ip ipsec policy
+                state: replace
+                lines: '{{ ipsec_policies | default([]) }}'
+
+            - name: Wireguards
+              when: mikrotik.OS > 6
+              tags: [ wireguard ]
+              mikrotik:
+                path: /interface wireguard
+                state: replace
+                lines: '{{ wireguards | default([]) }}'
+
+            - name: Wireguard peers
+              when: mikrotik.OS > 6
+              tags: [ wireguard ]
+              mikrotik:
+                path: /interface wireguard peer
+                state: '{{ wireguard_peers_state | default("replace") }}'
+                lines: '{{ wireguard_peers | default([]) }}'
+
+            - name: Interface list members
+              mikrotik:
+                path: /interface list member
+                state: replace
+                lines: '{{ interface_list_members | default([]) }}'
+
+        # END: Interfaces
+
+        - name: Addresses and routes
+          tags: [ iproutes ]
+          block:
+    
+            - name: IP addresses (add only - adjust after initial clearance)
+              tags: [ dangerous ]
+              when: initial is defined
+              mikrotik:
+                path: /ip address
+                state: present
+                lines: '{{ ip_addresses | default([]) }}'
+
+            - name: IP addresses
+              tags: [ dangerous ]
+              when: initial is undefined
+              mikrotik:
+                path: /ip address
+                state: adjust
+                keys: [ address ]
+                lines: '{{ ip_addresses | default([]) }}'
+
+            - name: DHCP clients
+              when: mikrotik.OS > 6 or 'dhcp' in mikrotik.packages
+              mikrotik:
+                path: /ip dhcp-client
+                state: replace
+                lines: '{{ dhcp_clients | default([]) }}'
+
+            - name: Routing tables
+              when: mikrotik.OS == 7
+              mikrotik:
+                path: /routing table
+                state: replace
+                lines: '{{ [] | zip_longest(routing_tables_v7,fillvalue="name") | map("dict") | map("combine",{"fib":None}) }}'
+#              vars:
+#                route_rt: '{{ routes | default([]) | selectattr("routing-mark","defined") | map(attribute="routing-mark") }}'
+#                rules_rt: '{{ routing_rules | default([]) | selectattr("routing-mark","defined") | rejectattr("routing-mark","eq","!") | map(attribute="routing-mark") }}'
+#                mangle_rt: '{{ mangle_firewall | default([]) | selectattr("new-routing-mark","defined") | map(attribute="new-routing-mark") }}'
+#                ospf_rt: '{{ ospf_instances | default([]) | selectattr("routing-table","defined") | map(attribute="routing-table") }}'
+#                all_rt: '{{ (route_rt + rules_rt + mangle_rt + ospf_rt) | unique }}'
+#
+            - name: Routes (add only - adjust after initial clearance)
+              tags: [ dangerous ]
+              when: initial is defined
+              mikrotik:
+                path: /ip route
+                state: present
+                lines: '{{ routes if mikrotik.OS == 6 else routes_v7 }}'
+              
+            - name: Routes
+              tags: [ dangerous ]
+              when: initial is undefined
+              mikrotik:
+                path: /ip route
+                state: adjust
+                keys: [ '{{ "routing-mark" if mikrotik.OS == 6 else "routing-table" }}', 'dst-address', 'distance' ]
+                lines: '{{ routes if mikrotik.OS == 6 else routes_v7 }}'
+
+            - name: Routing rules
+              mikrotik:
+                path: '{{ "/ip route" if mikrotik.OS == 6 else "/routing" }} rule'
+                state: adjust
+                keys: [ 'src-address', 'dst-address', 'routing-mark', 'interface', 'action', 'table' ]
+                ordered: '{{ routing_rules | default([]) }}'
+   
+            - name: Routing VRFs
+              mikrotik:
+                path: '/ip {{ "route" if mikrotik.OS == 6 }} vrf'
+                state: replace
+                lines: '{{ routing_vrfs|default([]) if mikrotik.OS == 6 else routing_vrfs_v7|default([]) }}'
+
+        # END: Addresses and routes
+
+        - name: Firewall
+          tags: [ firewall ]
+          block:
+
+            - name: Address lists
+              tags: [ address-lists ]
+              mikrotik:
+                path: /ip firewall address-list
+                state: adjust
+                keys: [ list, address ]
+                lines: '{{ address_lists | default([]) }}'
+    
+            - name: Filter firewall
+              tags: [ dangerous ]
+              mikrotik:
+                path: /ip firewall filter
+                state: adjust
+                keys: []
+                ordered: '{{ filter_firewall | default([]) }}'
+    
+            - name: NAT firewall
+              mikrotik:
+                path: /ip firewall nat
+                state: '{{ nat_firewall_state | default("replace") }}'
+                ordered: '{{ nat_firewall | default([]) }}'
+    
+            - name: Mangle firewall
+              mikrotik:
+                path: /ip firewall mangle
+                state: replace
+                ordered: '{{ mangle_firewall | default([]) }}'
+    
+            - name: Raw firewall
+              tags: [ dangerous ]
+              mikrotik:
+                path: /ip firewall raw
+                state: adjust
+                keys: []
+                lines: '{{ raw_firewall | default([]) }}'
+    
+        # END: Firewall
+
+        - name: Simple queues
+          tags: [ queues ]
+          mikrotik:
+            path: /queue simple
+            state: replace
+            ordered: '{{ simple_queues | default([]) }}'
+
+        - name: DHCP configuration
+          when: mikrotik.OS > 6 or 'dhcp' in mikrotik.packages
+          tags: [ dhcp ]
+          block:
+            - name: DHCP servers
+              mikrotik:
+                path: /ip dhcp-server
+                state: replace
+                lines: '{{ dhcp_servers | default([]) }}'
+
+            - name: DHCP networks
+              mikrotik:
+                path: /ip dhcp-server network
+                state: replace
+                lines: '{{ dhcp_networks | default([]) }}'
+
+            - name: DHCP leases
+              mikrotik:
+                path: /ip dhcp-server lease
+                state: '{{ dhcp_leases_state | default("replace") }}'
+                lines: '{{ dhcp_leases | default([]) }}'
+
+        # END: DHCP configuration
+
+        - name: Control and stats
+          tags: [ control ]
+          block:
+
+            - name: Romon
+              tags: [ dangerous ]
+              mikrotik:
+                path: /tool romon
+                set: { enabled: yes }
+    
+            - name: Romon ports
+              tags: [ dangerous ]
+              mikrotik:
+                path: /tool romon port
+                state: adjust
+                keys: [ interface ]
+                lines: '{{ romon_ports | default([]) }}'
+    
+            - name: Neighbor discovery settings
+              mikrotik:
+                path: /ip neighbor discovery-settings
+                set: { discover-interface-list: control }
+    
+            - name: MAC server settings
+              mikrotik:
+                path: /tool mac-server
+                set: { allowed-interface-list: control }
+    
+            - name: MAC-Winbox settings
+              mikrotik:
+                path: /tool mac-server mac-winbox
+                set: { allowed-interface-list: control }
+    
+            - name: Interface graphs
+              mikrotik:
+                path: /tool graphing interface
+                state: replace
+                lines: [ { interface: all, store-on-disk: no } ]
+    
+            - name: Queue graphs
+              mikrotik:
+                path: /tool graphing queue
+                state: replace
+                lines: [ { simple-queue: all, allow-target: no, store-on-disk: no } ]
+    
+            - name: Resource graphs
+              mikrotik:
+                path: /tool graphing resource
+                state: replace
+                lines: [ { store-on-disk: no } ]
+
+            - name: Scripts
+              tags: [ scripts ]
+              mikrotik:
+                path: /system script
+                state: adjust   # don't replace because of SNMP OID change
+                keys: [ name ]
+                lines: '{{ scripts | default([]) }}'
+
+            - name: Schedules
+              tags: [ scripts, schedules ]
+              mikrotik:
+                path: /system scheduler
+                state: replace
+                lines: '{{ schedules | default([]) }}'
+
+            - name: Netwatch
+              mikrotik:
+                path: /tool netwatch
+                state: replace
+                lines: '{{ netwatch | default([]) }}'
+
+
+        # END: Control and stats
+  
+    # END: RouterOS 6 and 7
+
+    - name: OSPF v6
+      tags: [ ospf ]
+      when: mikrotik.OS == 6
+      block:
+
+        - name: Routing filters
+          mikrotik:
+            path: /routing filter
+            state: replace
+            ordered: '{{ routing_filters | default([])}}'
+
+        - name: Remove stale OSPF areas and networks
+          vars:
+            _areas: '{{ (ospf_areas|selectattr("instance","defined")|map(attribute="instance") + ["default"])|join(",") }}'
+            _networks: '{{ ospf_networks|selectattr("area","defined")|map(attribute="area")|join(",") }}'
+          mikrotik:
+            config:
+              - path: /routing ospf network
+                state: absent
+                find:
+                  _raw: '!( [:find [:toarray "{{ _networks }}"] $area] >= 0 )'
+              - path: /routing ospf area
+                state: absent
+                find:
+                  _raw: '!( [:find [:toarray "{{ _areas }}"] $instance] >= 0 )'
+
+        - name: OSPF instances
+          mikrotik:
+            path: /routing ospf instance
+            state: adjust
+            keys: [ name, default ]
+            lines: '{{ ospf_instances|default([]) if replacement is undefined else ospf_instances|default([])|map("combine",{"disabled":"yes"}) }}' 
+
+        - name: OSPF areas
+          mikrotik:
+            path: /routing ospf area
+            state: adjust
+            keys: [ name, instance ]
+            lines: '{{ ospf_areas | default([]) }}'
+
+        - name: OSPF interfaces
+          mikrotik:
+            path: /routing ospf interface
+            state: replace
+            lines: '{{ ospf_interfaces | default([]) }}'
+
+        - name: OSPF networks
+          mikrotik:
+            path: /routing ospf network
+            state: adjust
+            keys: [ network ]
+            lines: '{{ ospf_networks | default([]) }}'
+
+        - name: OSPF area ranges
+          mikrotik:
+            path: /routing ospf area range
+            state: replace
+            lines: '{{ ospf_area_ranges | default([]) }}'
+
+    # END: OSPF 6
+
+    - name: OSPF v7
+      tags: [ ospf ]
+      when: mikrotik.OS == 7
+      block:
+
+        - name: Default BFD instance
+          mikrotik:
+            path: /routing bfd configuration
+            lines:
+              - { disabled: no }
+
+        - name: Routing filters
+          mikrotik:
+            path: /routing filter rule
+            state: replace
+            ordered: '{{ routing_filters_v7 | default([]) }}'
+
+        - name: OSPF instances
+          mikrotik:
+            path: /routing ospf instance
+            state: adjust
+            keys: [ name ]
+            lines: '{{ ospf_instances_v7|default([]) if replacement is undefined else ospf_instances_v7|default([])|map("combine",{"disabled":"yes"}) }}' 
+        - name: OSPF areas
+          mikrotik:
+            path: /routing ospf area
+            state: adjust
+            keys: [ name, instance ] 
+            lines: '{{ ospf_areas_v7 | default([]) }}'
+        - name: OSPF interface templates
+          mikrotik:
+            path: /routing ospf interface-template
+            state: adjust
+            keys: [ area, networks, interfaces ]
+            lines: '{{ ospf_interface_templates_v7 | default([]) }}'
+        - name: OSPF area ranges
+          mikrotik:
+            path: /routing ospf area range
+            state: replace
+            lines: '{{ ospf_area_ranges_v7 | default([]) }}'
+
+    # END: OSPF 7
+
+
+
+    - name: Finalizing initial configuration
+      when: initial is defined
+      block:
+        - name: Reconnect using new address
+          set_fact:
+            ansible_host: '{{ replacement if replacement is defined else save_ansible_host }}'
+            #ansible_host: '{{ router_ipaddr }}'
+            ansible_user: ''
+            ansible_password: ''
+        - debug:
+            var: ansible_host
+        - name: Clear host key
+          local_action: command ssh-keygen -R {{ ansible_host }}
+          changed_when: false
+          failed_when: false
+        - name: IP addresses adjustement
+          mikrotik:
+            path: /ip address
+            state: adjust
+            keys: [ address ]
+            lines: '{{ ip_addresses | default([]) }}'
+        - name: Routes adjustement
+          mikrotik:
+            path: /ip route
+            state: adjust
+            keys: [ '{{ "routing-mark" if mikrotik.OS == 6 else "routing-table" }}', 'dst-address', 'distance' ]
+            lines: '{{ routes if mikrotik.OS == 6 else routes_v7 }}'
+
+    - name: Enable all ethernets
+      mikrotik:
+        path: /interface ethernet
+        state: enabled
+        find:
+
+    - name: Reboot if necessary
+      tags: [ dangerous ]
+      when: initial is defined and mikrotik.OS > 6
+      mikrotik:
+        cmd: /system reboot
